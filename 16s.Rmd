@@ -1,0 +1,1147 @@
+---
+title: "Bacterial Microbiome of Foreskin Tissue: R analysis"
+author: "BMaust"
+date: "2022-08-31"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+#library(dada2)
+library(ggplot2)
+library(ggh4x)
+library(reshape)
+library(ShortRead)
+library(phyloseq)
+library(vegan)
+library(DESeq2)
+library(pals)
+library(decontam)
+library(cowplot)
+library(RCurl)
+library(microbiome)
+library(ggpubr)
+library(ggprism)
+library(dplyr)
+library(phylosmith)
+library(data.table)
+library(scales)
+library(ade4)
+library(cluster)
+library(readstata13)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(microViz)
+library(glue)
+library(factoextra)
+library(RColorBrewer)
+library(readr)
+library(ALDEx2)
+library(ANCOMBC)
+library(EnhancedVolcano)
+library(biomaRt)
+
+source('microfiltR_source_code.R')
+
+#override phyloseq plot_bar function to customize output
+plot_bar_bsm <- function (physeq, x = "Sample", y = "Abundance", 
+    fill = NULL, title = NULL, facet_grid = NULL, border_color = "black", values=NULL) 
+{
+    mdf = psmelt(physeq)
+    p = ggplot(mdf, aes_string(x = x, y = y, fill = fill))
+    p = p + geom_bar(stat = "identity", position = "stack") + theme_bw()
+    p = p + theme(axis.text.x = element_text(angle = -90, hjust = 0))
+    if (!is.null(facet_grid)) {
+        p <- p + facet_grid(facet_grid)
+    }
+    if (!is.null(title)) {
+        p <- p + ggtitle(title)
+    }
+    if(!is.null(values)) {
+      p <- p + scale_fill_manual( values=values )
+    }
+
+    return(p)
+}
+
+#override phyloseq plotQualityProfile function to add lines at Q30 and Q25 to output
+plotQualityProfile_bsm <- function (fl, n = 5e+05, aggregate = FALSE) 
+{
+    statdf <- data.frame(Cycle = integer(0), Mean = numeric(0), 
+        Q25 = numeric(0), Q50 = numeric(0), Q75 = numeric(0), 
+        Cum = numeric(0), file = character(0))
+    anndf <- data.frame(minScore = numeric(0), label = character(0), 
+        rclabel = character(0), rc = numeric(0), file = character(0))
+    FIRST <- TRUE
+    for (f in fl[!is.na(fl)]) {
+        srqa <- qa(f, n = n)
+        df <- srqa[["perCycle"]]$quality
+        rc <- sum(srqa[["readCounts"]]$read)
+        if (rc >= n) {
+            rclabel <- paste("Reads >= ", n)
+        }
+        else {
+            rclabel <- paste("Reads: ", rc)
+        }
+        means <- rowsum(df$Score * df$Count, df$Cycle)/rowsum(df$Count, 
+            df$Cycle)
+        get_quant <- function(xx, yy, q) {
+            xx[which(cumsum(yy)/sum(yy) >= q)][[1]]
+        }
+        q25s <- by(df, df$Cycle, function(foo) get_quant(foo$Score, 
+            foo$Count, 0.25), simplify = TRUE)
+        q50s <- by(df, df$Cycle, function(foo) get_quant(foo$Score, 
+            foo$Count, 0.5), simplify = TRUE)
+        q75s <- by(df, df$Cycle, function(foo) get_quant(foo$Score, 
+            foo$Count, 0.75), simplify = TRUE)
+        cums <- by(df, df$Cycle, function(foo) sum(foo$Count), 
+            simplify = TRUE)
+        if (!all(sapply(list(names(q25s), names(q50s), names(q75s), 
+            names(cums)), identical, rownames(means)))) {
+            stop("Calculated quantiles/means weren't compatible.")
+        }
+        if (FIRST) {
+            plotdf <- cbind(df, file = basename(f))
+            FIRST <- FALSE
+        }
+        else {
+            plotdf <- rbind(plotdf, cbind(df, file = basename(f)))
+        }
+        statdf <- rbind(statdf, data.frame(Cycle = as.integer(rownames(means)), 
+            Mean = means, Q25 = as.vector(q25s), Q50 = as.vector(q50s), 
+            Q75 = as.vector(q75s), Cum = 10 * as.vector(cums)/min(rc, 
+                n), file = basename(f)))
+        anndf <- rbind(anndf, data.frame(minScore = min(df$Score), 
+            label = basename(f), rclabel = rclabel, rc = rc, 
+            file = basename(f)))
+    }
+    anndf$minScore <- min(anndf$minScore)
+    if (aggregate) {
+        plotdf.summary <- aggregate(Count ~ Cycle + Score, plotdf, 
+            sum)
+        plotdf.summary$label <- paste(nrow(anndf), "files (aggregated)")
+        means <- rowsum(plotdf.summary$Score * plotdf.summary$Count, 
+            plotdf.summary$Cycle)/rowsum(plotdf.summary$Count, 
+            plotdf.summary$Cycle)
+        q25s <- by(plotdf.summary, plotdf.summary$Cycle, function(foo) get_quant(foo$Score, 
+            foo$Count, 0.25), simplify = TRUE)
+        q50s <- by(plotdf.summary, plotdf.summary$Cycle, function(foo) get_quant(foo$Score, 
+            foo$Count, 0.5), simplify = TRUE)
+        q75s <- by(plotdf.summary, plotdf.summary$Cycle, function(foo) get_quant(foo$Score, 
+            foo$Count, 0.75), simplify = TRUE)
+        cums <- by(plotdf.summary, plotdf.summary$Cycle, function(foo) sum(foo$Count), 
+            simplify = TRUE)
+        statdf.summary <- data.frame(Cycle = as.integer(rownames(means)), 
+            Mean = means, Q25 = as.vector(q25s), Q50 = as.vector(q50s), 
+            Q75 = as.vector(q75s), Cum = 10 * as.vector(cums)/sum(pmin(anndf$rc, 
+                n)))
+        p <- ggplot(data = plotdf.summary, aes(x = Cycle, y = Score)) + 
+            geom_tile(aes(fill = Count)) + scale_fill_gradient(low = "#F5F5F5", 
+            high = "black") + geom_line(data = statdf.summary, 
+            aes(y = Mean), color = "#66C2A5") + geom_line(data = statdf.summary, 
+            aes(y = Q25), color = "#FC8D62", size = 0.25, linetype = "dashed") + 
+            geom_line(data = statdf.summary, aes(y = Q50), color = "#FC8D62", 
+                size = 0.25) + geom_line(data = statdf.summary, 
+            aes(y = Q75), color = "#FC8D62", size = 0.25, linetype = "dashed") + 
+            ylab("Quality Score") + xlab("Cycle") + annotate("text", 
+            x = 0, y = 0, label = sprintf("Total reads: %d", 
+                sum(anndf$rc)), color = "red", hjust = 0) + theme_bw() + 
+            theme(panel.grid = element_blank()) + guides(fill = FALSE) + 
+            facet_wrap(~label) + 
+              scale_x_continuous(minor_breaks = seq(0,300,25), breaks=seq(0,300, 100), guide='axis_minor') +
+          theme(ggh4x.axis.ticks.length.minor = rel(1)) +
+          geom_hline(yintercept = 30, color='#999999') + 
+          geom_hline(yintercept = 25, color='#cccccc')  
+        if (length(unique(statdf$Cum)) > 1) {
+            p <- p + geom_line(data = statdf.summary, aes(y = Cum), 
+                color = "red", size = 0.25, linetype = "solid") + 
+                scale_y_continuous(limits = c(0, NA), sec.axis = sec_axis(~. * 
+                  10, breaks = c(0, 100), labels = c("0%", "100%"))) + 
+                theme(axis.text.y.right = element_text(color = "red"), 
+                  axis.title.y.right = element_text(color = "red")) 
+        }
+        else {
+            p <- p + ylim(c(0, NA))
+        }
+    }
+    else {
+        p <- ggplot(data = plotdf, aes(x = Cycle, y = Score)) + 
+            geom_tile(aes(fill = Count)) + 
+          scale_fill_gradient(low = "#F5F5F5", high = "black") + 
+          geom_line(data = statdf, aes(y = Mean),  color = "#66C2A5") + 
+          geom_line(data = statdf, aes(y = Q25),  color = "#FC8D62", size = 0.25, linetype = "dashed") + 
+          geom_line(data = statdf, aes(y = Q50), color = "#FC8D62", size = 0.25) + 
+          geom_line(data = statdf, aes(y = Q75),  color = "#FC8D62", size = 0.25, linetype = "dashed") + 
+            ylab("Quality Score") + xlab("Cycle") + 
+          theme_bw() + 
+            theme(panel.grid = element_blank()) + guides(fill = FALSE) + 
+            geom_text(data = anndf, aes(x = 0, label = rclabel, y = 0), color = "red", hjust = 0) + 
+          facet_wrap(~file) + 
+              scale_x_continuous(minor_breaks = seq(0,300,25), breaks=seq(0,300, 100), guide='axis_minor') +
+          theme(ggh4x.axis.ticks.length.minor = rel(1)) +
+          geom_hline(yintercept = 30, color='#999999') + 
+          geom_hline(yintercept = 25, color='#cccccc')  
+        if (length(unique(statdf$Cum)) > 1) {
+            p <- p + geom_line(data = statdf, aes(y = Cum), color = "red", 
+                size = 0.25, linetype = "solid") + scale_y_continuous(limits = c(0, 
+                NA), sec.axis = sec_axis(~. * 10, breaks = c(0, 
+                100), labels = c("0%", "100%"))) + theme(axis.text.y.right = element_text(color = "red"), 
+                axis.title.y.right = element_text(color = "red"))
+        }
+        else {
+            p <- p + ylim(c(0, NA))
+        }
+    }
+    p
+}
+
+# remove taxa that might have 16s hits but are not bacteria from phyloseq object
+drop_non_bact <- function (ps_o) {
+  ret_ps <- subset_taxa(ps_o, Kingdom == 'Bacteria')
+  ret_ps <- subset_taxa(ret_ps, Phylum != 'NA' & Phylum != 'Cyanobacteria/Chloroplast')
+  ret_ps <- subset_taxa(ret_ps, Family != 'Mitochondria')
+  ret_ps <- subset_taxa(ret_ps, Order != 'Chloroplast')
+  return(ret_ps)
+}
+
+# format DESeq result object and graph
+des_plot <- function (res,tax_t,alpha=0.05, log2fChange_thresh = 0){
+  sigtab = data.frame(res[which(res$padj < alpha), ])
+  sigtab = sigtab[which(abs(sigtab$log2FoldChange) > log2fChange_thresh), ]
+  if (nrow(sigtab) == 0) {
+    stop(paste('Error: No signficant results at alpha = ', alpha))
+  }
+  sigtab = cbind(sigtab, as(tax_t[rownames(sigtab),], 'matrix'))
+  
+  # Genus order
+  x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+  x = sort(x, TRUE)
+  sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+  
+  sigtab$Species[is.na(sigtab$Species)] <- '(unclassified)'
+  sigtab$genus_sp = paste(sigtab$Genus, sigtab$Species)
+  
+  g <- ggplot(sigtab, aes(y=genus_sp, x=log2FoldChange, color=as.numeric(padj) )) +
+    geom_point(size=8,alpha=0.7) +  
+    scale_color_gradientn(colors=parula(10), guide="colourbar") + 
+    labs(color = 'p-value (adj)',y='Genus sp') +theme_bw() + 
+    scale_x_continuous(expand=c(0.25,0)) + 
+    geom_text(aes(label=formatC(padj,format='e', digits=2)),color='#000000', size=4, nudge_y=-0.1 )
+  
+}
+
+# make a DESreq result object into a data frame with usefully named rows
+des_df <- function (des_r, tt) {
+  sigtab = data.frame(des_r)
+  sigtab = cbind(sigtab, as(tt[rownames(sigtab),], 'matrix'))
+  rownames(sigtab) <- paste0('result',1:nrow(sigtab))
+  return(sigtab)
+}
+
+# add a pseudocount of 1 to entries in a vector that == 0
+pc_add <- function(x) {
+  as.integer(ifelse(x == 0, 1, x))
+}
+
+do_aldex <- function (ps_obj, samp_var, mc.count = 1000) {
+  asv_data <- t(data.frame(otu_table(ps_obj)))
+  
+  clr <- aldex.clr(
+    reads = asv_data,
+    conds = sample_data(ps_obj)[[samp_var]],
+    mc.samples = mc.count,
+    denom = 'all',
+    verbose = T
+  )
+  
+  tt <- aldex.ttest(clr, paired.test=F, verbose = T)
+  eff <- aldex.effect(clr, CI = T, verbose = T)
+  
+  return(data.frame(tt,eff))
+}
+
+```
+
+# FASTQ processing with Dada2
+```{r fastq, echo=FALSE}
+#USE TRIMMED FILES!!!
+#also: don't include junk reads from unused indices to learn errors!
+path <- "/Users/bmaust/BaseSpace/Untitled_from_220425_M01375_0282_000000000-KD8PT-348738390/FASTQ_Generation_2022-04-28_10_48_33Z-556291739"
+#TODO: clean path above
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_L001_R1_001.trim.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_L001_R2_001.trim.fastq", full.names = TRUE))
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+#visualize quality (inspect these results to determine cut points below)
+pdf("qual.pdf")
+plotQualityProfile_bsm(fnFs[1:10])
+plotQualityProfile_bsm(fnRs[1:10])
+dev.off()
+
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+
+#filter reads with > 3EE and chop reads at 250, 210bp (edit these values based on above graphs)
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,210),
+                     maxN=0, maxEE=c(2,3), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE, matchIDs=TRUE)
+
+errF <- learnErrors(filtFs, multithread=TRUE, nbases = 1e9, randomize = TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE, nbases = 1e9, randomize = TRUE)
+
+#visualize the error rates (inspect for sanity check)
+plotErrors(errF, nominalQ=TRUE)
+ggsave('erors.pdf')
+
+#derep with error estimate
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+keep <- out[,"reads.out"] >0 # Or other cutoff
+names(derepFs) <- sample.names[keep]
+names(derepRs) <- sample.names[keep]
+
+#infer samples
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE, pool = FALSE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE, pool = FALSE)
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, minOverlap=12, verbose=TRUE)
+seqtab <- makeSequenceTable(mergers)
+
+#view length distribution
+hist.dat <- as.data.frame(table(nchar(getSequences(seqtab))))
+hist.dat$Var1 <- as.numeric(paste0(hist.dat$Var1))
+
+#plot it (inspect this for cutoff reasonability)
+ggplot(hist.dat, aes(Var1, Freq)) + geom_col() + scale_y_log10() + 
+  geom_vline(xintercept = 401, color="firebrick1") + 
+  geom_vline(xintercept = 435, color="firebrick1")
+ggsave('lengths.pdf')
+
+#remove nontarget amplicons (weird short ones)
+seqtab.f <- seqtab[,nchar(colnames(seqtab)) %in% seq(400, 436)]
+
+hist.dat.f <- as.data.frame(table(nchar(getSequences(seqtab.f))))
+hist.dat.f$Var1 <- as.numeric(paste0(hist.dat.f$Var1))
+ggplot(hist.dat.f, aes(Var1, Freq)) + geom_col() + scale_y_log10() + 
+  geom_vline(xintercept = 401, color="firebrick1") + 
+  geom_vline(xintercept = 435, color="firebrick1")
+
+#remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab.f, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+#nonchimeric % of reads
+(sum(seqtab.nochim)/sum(seqtab.f))
+
+#track progress
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out[keep, ], sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names[keep]
+
+track_t <- data.frame(id=sample.names[keep],trimmed = out[keep,'reads.in'], filtered=out[keep,'reads.out'], denoised_F = sapply(dadaFs, getN), denoised_R = sapply(dadaRs, getN), merged = sapply(mergers, getN), nonchim = rowSums(seqtab.nochim))
+track_m <- melt(track_t,'id')
+
+ggplot(track_m, aes(x= id, y= value)) + geom_bar(aes(fill=variable), stat='identity', position='dodge' ) +
+  theme_bw() + xlab("Specimen") + ylab("Count")
+ggsave('counts.pdf')
+
+saveRDS(track_t,"track_t.rds")
+#View(track)
+
+#assign taxa
+taxa <- assignTaxonomy(seqtab.nochim, "/Users/bmaust/RStudioProjects/chaps-16s/data/silva_nr99_v138.1_wSpecies_train_set_BPB_SD_110921.fa.gz", minBoot = 60, multithread = TRUE)
+#TODO: sanitize path
+
+saveRDS(seqtab.nochim, "seqtab_nochim.rds") 
+saveRDS(taxa, "taxa.rds")
+
+ps<-phyloseq(tax_table(taxa),otu_table(seqtab.nochim, taxa_are_rows = FALSE))
+```
+
+```{r data_load, width=8, height=4}
+ps <- readRDS('data/ps-renamed.rds')
+
+samdf<-read.csv('data/chaps-run2-extdata.csv',header=TRUE)
+samdf <- samdf %>% mutate(condition = paste(sample.name,index))
+samdf <- samdf %>% mutate(site = case_when(
+    substr(sample.name,1,2) == 'CJ' ~ 'CJ',
+    substr(sample.name,1,2) == 'EB' ~ 'EB',
+    TRUE ~ as.character(NA)
+  )
+)
+rownames(samdf)<- samdf$index
+samdf <- samdf %>% mutate(drug = recode(drug, 'Tr'='F/TDF'))
+samdf$drug <- factor(samdf$drug, levels=c('control','F/TAF','F/TDF'))
+samdf$placebo <- ifelse(samdf$drug == 'control', T, F)
+samdf$TAF <- ifelse(samdf$drug == 'F/TAF', T, F)
+samdf$drug_rename <- samdf$drug
+levels(samdf$drug_rename)[levels(samdf$drug_rename) == 'control'] <- 'placebo'
+levels(samdf$drug_rename)[levels(samdf$drug_rename) == 'F/TAF'] <- 'FTC/TAF'
+levels(samdf$drug_rename)[levels(samdf$drug_rename) == 'F/TDF'] <- 'FTC/TDF'
+
+cli <- read.dta13('data/meta_data_Heather_Brandon.dta')
+
+samdf<- samdf %>% mutate(sample.join = str_replace(sample.name,'-','')) %>% left_join(cli, by=c('sample.join'='subjid_ran')) 
+
+rownames(samdf)<- samdf$index
+sample_data(ps) <- samdf
+
+ps<-merge_phyloseq(ps,read_tree('data/chaps-fs-asv-ssualign.phylip_phyml_tree.txt'))
+```
+## Cleaning
+
+### Decontam
+Decontam can only do prevalence-based filtering since there are no reliable quantitations for these specimens. Doing this before microfilt, then will drop ctrl-neg specimens.
+
+```{r decontam, echo=FALSE}
+ps.decon <- drop_non_bact(ps)
+ps.decon <- subset_samples(ps.decon, location == 'fs' | location == 'ctrl-neg') #restrict to project and NTC specimens
+ps.decon <- filter_taxa(ps.decon, function(x){sum(x>0)>=1}, prune = TRUE)
+
+sample_data(ps.decon)$is_neg <- sample_data(ps.decon)$location == 'ctrl-neg'
+
+decon.sdf <- as.data.frame(sample_data(ps.decon))
+decon.sdf$LibrarySize <- sample_sums(ps.decon)
+decon.sdf<-decon.sdf[order(decon.sdf$LibrarySize),]
+decon.sdf$Index <- seq(nrow(decon.sdf))
+  
+ggplot(data=decon.sdf,aes(x=Index,y=LibrarySize,color=is_neg))+ geom_point() + theme_bw() +
+  theme(axis.title.x = element_blank())
+
+if (sum(decon.sdf$is_neg) <1 ) stop("This won't work without negative controls")
+
+contamdf.p <- isContaminant(ps.decon,method='prevalence', neg='is_neg', threshold=0.5)
+ps.pa <- transform_sample_counts(ps.decon, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$is_neg == TRUE, ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$is_neg == FALSE, ps.pa)
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                      contaminant=contamdf.p$contaminant)
+ctrl_spp <- subset(df.pa, pa.neg > 0)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_jitter() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)") + 
+  scale_color_manual(values = c('#096DD9','#E6550D')) + geom_text(data=ctrl_spp, aes(label=row.names(ctrl_spp)))
+
+ps.decon <- prune_taxa(!df.pa$contaminant, ps.decon)
+```
+
+### read-based filtering
+```{R post-cleanup, echo=FALSE, width=16, height=9}
+sd_precleaned <- sample_data(ps.decon)
+sd_precleaned$TotalReads = sample_sums(ps.decon)
+sd_precleaned %>% ggplot(aes(x=reorder(condition,TotalReads), y=TotalReads), fill='#cccccc') +
+  geom_bar(stat='identity') + theme_bw() + theme(axis.text=element_text(size=6, angle=90)) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) +
+  geom_text(aes(label = TotalReads), hjust=-0.6, size=2, angle=90) + xlab('condition') 
+
+ps.fs <- subset_samples(ps.decon, location=='fs')
+sd_cleaned <- sample_data(ps.fs)
+sd_cleaned$TotalReads = sample_sums(ps.fs)
+sd_cleaned %>% ggplot(aes(x=reorder(condition,TotalReads), y=TotalReads), fill='#cccccc') +
+  geom_bar(stat='identity') + theme_bw() + theme(axis.text=element_text(size=6, angle=90)) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) +
+  geom_text(aes(label = TotalReads), hjust=-0.6, size=2, angle=90) + xlab('condition') 
+ps.fs <- prune_samples(sample_sums(ps.fs) > 50, ps.fs)
+ps.fs <- filter_taxa(ps.fs, function(x) {sum(x>0) >= 1}, prune=TRUE)
+
+sd_pruned <- sample_data(ps.fs)
+sd_pruned$TotalReads = sample_sums(ps.fs)
+sd_pruned %>% ggplot(aes(x=reorder(condition,TotalReads), y=TotalReads), fill='#cccccc') +
+  geom_bar(stat='identity') + theme_bw() + theme(axis.text=element_text(size=6, angle=90)) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) +
+  geom_text(aes(label = TotalReads), hjust=-0.6, size=2, angle=90) + xlab('condition') 
+```
+
+# Figure 1: Taxa summaries
+```{R taxa_sums}
+ps.fs.glom <- tax_glom(ps.fs, taxrank="Genus")
+ps.fs.glom.rel <- transform_sample_counts(ps.fs.glom, function(OTU) OTU/sum(OTU))
+#top20.decon <- names(sort(taxa_sums(ps.fs.glom), decreasing=TRUE))[1:25]
+ps.top.fs <- prune_taxa(names(sort(taxa_sums(ps.fs.glom), decreasing=TRUE))[1:25] ,ps.fs.glom.rel)
+ps.top.fs.melt <- psmelt(ps.top.fs)
+samp_top20_cov <- ps.top.fs.melt %>% group_by(sample.name,drug) %>% summarise(perc_cov = sum(Abundance)) %>% ungroup()
+
+# add "others" row to sum up to 1
+samp_top20_cov.adj <- samp_top20_cov %>% mutate(Abundance = 1 - perc_cov, Genus ='(Others)') %>% dplyr::select(sample.name, drug, Abundance, Genus)
+ps.top.fs.melt.add <- bind_rows(ps.top.fs.melt, samp_top20_cov.adj)
+
+#find counts of groups for shading
+drug_counts <- ps.top.fs.melt %>% group_by(drug) %>% summarise(samp_count = n_distinct(sample.name)) %>% ungroup()
+delta = 0.5
+rects <- list(
+  placebo = c(delta,1+as.numeric(drug_counts[1,'samp_count'])),
+  TAF = c(),
+  TDF = c()
+)
+rects[['TAF']] <- c(rects[['placebo']][2], rects[['placebo']][2] + as.numeric(drug_counts[2,'samp_count']))
+rects[['TDF']] <- c(rects[['TAF']][2], rects[['TAF']][2] + as.numeric(drug_counts[3,'samp_count'])- delta)
+
+browns = c(
+  '#422412','#3D210D','#4E2B15','#572F12','#5E3A21',
+  '#703A13','#6F4B2D','#8A4513','#825B3A','#A45117',
+  '#956B47','#BD5F1b','#A87C56','#D46E25','#B78F6D',
+  '#DF8545','#C5A285','#E99B62','#D3B79E','#F1B280',
+  '#E0CAB7','#F7CA9E','#EDE0D1',
+  '#FCE1Bc', '#FAF4EB', '#FFFBDC'
+)
+
+purples = c("#3D0F99","#653EB3","#967ACC","#C7B8E6")
+
+# note: this gets reversed below
+#sp_colors = c( "#FF5005","#FFE100","#FFFF80","#990000","#740AFF","#E0FF66","#00998F","#5EF1F2","#FF0010","#426600","#FFA8BB", "#FFA405","#003380","#C20088","#9DCC00","#8F7C00","#94FFB5","#FFCC99","#2BCE48","#005C31","#191919", "#CCCCCC", "#4C005C","#993F00","#F0A0FF","#0075DC" )
+
+sp_colors = c(
+'#FCE1Bc',"#F7CA9E","#E0CAB7","#F1B280","#D3B79E","#E99B62","#C5A285","#DF8545",
+"#B78F6D","#D46E25","#A87C56","#BD5F1b",
+"#999999", #S5-A14a
+"#A45117",
+"#555555", #W5053
+"#8A4513", "#6F4B2D","#703A13","#825B3A",
+'#3D0F99', #staph
+"#8A4513",
+'#eeeeee', #other
+"#99330B","#703A13","#422412",
+'#c7b8E6' #coryne
+)
+ps.top.fs.melt.add %>% 
+  arrange(drug,sample.name) %>% 
+  mutate(sample.name = paste0(sample.name,drug)) %>%
+  mutate(sample_sort = factor(sample.name, levels=unique(sample.name))) %>%
+  ggplot(aes(x=sample_sort, y=Abundance, fill=fct_reorder(Genus,Abundance))) + 
+  geom_bar(stat = "identity", position = "stack") + theme_bw() + 
+  xlab('treatment received') + ylab('Relative abundance') + scale_y_continuous(expand=c(0,0)) +
+  scale_fill_manual(name='Genus (abundance order)', values=sp_colors) +
+  theme(axis.text.x = element_text(hjust = 0, size=8), 
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()
+        ) +  
+  guides(fill=guide_legend(reverse = TRUE)) +
+  scale_x_discrete(breaks=c('CJ-005control','CJ-001F/TAF','CJ-003F/TDF'), labels = c('CJ-005control' = 'placebo','CJ-001F/TAF' = 'FTC/TAF','CJ-003F/TDF' = 'FTC/TDF') ) +
+  annotate('rect', fill='#B3823E', xmin=rects[['placebo']][1], xmax=rects[['placebo']][2], ymin=-0.01, ymax=0) +
+  annotate('rect', fill='#0F8299', xmin=rects[['TAF']][1], xmax=rects[['TAF']][2], ymin=-0.01, ymax=0) +
+  annotate('rect', fill='#7ABECC', xmin=rects[['TDF']][1], xmax=rects[['TDF']][2], ymin=-0.01, ymax=0)
+  #geom_bar(width=0.9, aes(y=5, fill=drug) )
+ggsave('fig1_relabund.png', width=8, height=4.5)
+```
+
+# Figure 2: distance-based clustering and visualization
+
+``` {R distance}
+alpha_div <- estimate_richness(ps.fs, measures='Shannon')
+sample_data(ps.fs)$Shannon <- alpha_div$Shannon
+
+asv.glom.r <- otu_table(ps.fs.glom.rel)
+taxa.glom.r <- tax_table(ps.fs.glom.rel)
+taxa.glom.r.dt <- data.table(taxa.glom.r)
+taxa.glom.r.dt$ASV = rownames(taxa.glom.r)
+
+uf.dist <- phyloseq::distance(ps.fs, method='unifrac')
+
+#https://microucph.github.io/amplicon_data_analysis/html/cluster.html
+n_clust <- 2:10
+pams <- lapply(n_clust, function(x) pam(uf.dist, k=x))
+sils <- lapply(pams, function(x) mean(x$silinfo$widths[, 'sil_width']))
+plot(n_clust, sils, type='l')
+
+pam_res <- pam(uf.dist, k=2)
+pam_res$data <- uf.dist
+fviz_cluster(pam_res)
+
+fviz_nbclust(as.matrix(uf.dist), pam, method='gap_stat')
+fviz_nbclust(as.matrix(uf.dist), pam, method='wss')
+
+#https://afit-r.github.io/kmeans_clustering#kmeans
+wss <- function(k) {
+  kmeans(as.matrix(uf.dist), k, nstart = 10 )$tot.withinss
+}
+
+ks <- 1:15
+wss_values <- map_dbl(ks, wss)
+plot(ks, wss_values,
+       type="b", pch = 19, frame = FALSE, 
+       xlab="Number of clusters K",
+       ylab="Total within-clusters sum of squares")
+
+sample_data(ps.fs)$cluster_uf <- factor(pam(uf.dist, k=2, cluster.only=T))
+uf.ord <- ordinate(ps.fs, method='PCoA', distance = uf.dist)
+uf.clust.ado <- adonis2(uf.dist ~ sample_data(ps.fs)$cluster_uf)
+uf_disp <- betadisper(uf.dist, sample_data(ps.fs)$cluster_uf)
+uf_disp.test <- permutest(uf_disp)
+r2 <- signif(uf.clust.ado$R2[1], digits=2)
+pv <- signif(uf.clust.ado$`Pr(>F)`, digits=2)
+plot_ordination(ps.fs, uf.ord) + 
+  theme_bw() +
+  geom_point(aes(fill=cluster_uf), shape=21, size=4, color='black',  stroke=0.5) +
+  coord_fixed(ratio=1) + 
+  theme(axis.title.x = element_text(size=9), 
+        axis.title.y = element_text(size=9),
+        legend.title = element_text(size=9),
+        legend.text = element_text(size=9),
+        legend.margin = margin(0,0,0,0),
+        legend.box.margin = margin(-5,-5,-5,-8)
+        ) +
+  scale_fill_manual(name='Cluster #', values=c('#757575','#daa138','#71b3e4','#4B9B76', '#F0E442')) +
+  annotate('text', label=paste0("R^2==",r2),x=-0.25, y=0.45,parse=T) +
+  annotate('text', label='p < 0.001',x=-0.25, y=0.40,parse=F)
+ggsave('fig2b_beta.png',width=8, height=6)
+  
+cstdf <- data.frame(sample_data(ps.fs))
+
+shan.test.clust_uf <- rstatix::wilcox_test(cstdf, Shannon ~ cluster_uf, 
+  comparisons = list(c(1,2) ), paired=F, exact=T) %>% 
+  rstatix::add_x_position()
+  
+ggplot(cstdf, aes(x=cluster_uf, y=Shannon)) +
+  geom_boxplot(aes(color=cluster_uf, alpha=0.01, fill=cluster_uf)) + 
+  geom_dotplot(aes(fill=cluster_uf), binaxis='y', stackdir='center') +
+  theme_bw() + labs(fill='CST', y='Shannon diversity', x='CST') +
+  theme(legend.position = "none") + 
+  scale_fill_manual(values=c('#757575','#daa138','#71b3e4','#4B9B76', '#F0E442')) + 
+  scale_color_manual(values=c('#757575','#daa138','#71b3e4','#4B9B76', '#F0E442')) 
+  #add_pvalue(shan.test.clust_uf, y.position=5.0, label='p')
+
+ggsave('alpha_uf5.png')
+
+ps.fs.sp_glom <- tax_glom(ps.fs,taxrank="Species", NArm = F)
+ps.fs.sp.top.abs <- prune_taxa(names(sort(taxa_sums(ps.fs), decreasing=TRUE))[1:25] ,ps.fs.sp_glom)
+tt <- data.frame(tax_table(ps.fs.sp.top.abs))
+tt$Species = paste(
+  tt$Genus, 
+  ifelse(is.na(tt$Species), '(undefined sp.)', tt$Species)
+)
+tax_table(ps.fs.sp.top.abs)[,"Species"] <- tt[,"Species"] #syntax cry!
+
+ps.fs.top.sp.abs.log10 <- microbiome::transform(ps.fs.sp.top.abs, 'log10') %>%
+  ps_arrange(cluster_uf,sample.name)
+
+abunds <- t(otu_table(ps.fs.top.sp.abs.log10))
+rownames(abunds) <- tax_table(ps.fs.top.sp.abs.log10)[, 'Species'] #this was manipulated earlier
+metad <- meta(ps.fs.top.sp.abs.log10)
+
+ha_shan_tx_cst <- HeatmapAnnotation(
+  'Shannon div' = anno_points( metad$Shannon, axis_param = list(side='right') ),
+  Treatment = metad$drug_rename,
+  CST = metad$cluster_uf,
+  col = list('Treatment' =c('placebo' = '#B3823E', 'FTC/TAF' = '#0F8299','FTC/TDF'='#7ABECC'),
+             'CST' = c('1'='#757575', '2'='#daa138')),
+  annotation_name_side = 'left',
+  annotation_legend_param = list(
+    title_position = 'lefttop-rot',
+    grid_height = unit(6,'mm'),
+    grid_width = unit(5,'mm')
+  )
+)
+
+ht <- Heatmap(abunds, 
+        name='log10 abd',
+        column_split = metad$cluster_uf,
+        cluster_columns = FALSE,
+        top_annotation = ha_shan_tx_cst,
+        column_title = NULL,
+        show_column_names = F,
+        row_names_gp = gpar(fontsize=11),
+        row_names_max_width = max_text_width(
+          rownames(abunds),
+          gp = gpar(fontsize=11)
+        ),
+        heatmap_legend_param = list(
+          title_position = 'lefttop-rot',
+          title = 'reads per taxon',
+          legend_height = unit(4,'cm'),
+          at = c(0,1,2,3,4,5), labels = c('0','10','100','1000','10,000','100,000')
+        ),
+        col = rev(brewer.pal(n = 5, name = "RdYlBu"))
+)
+draw(ht, merge_legends = TRUE)
+dev.copy(png,'fig2a_heatmap.png',width=3900,height=2000, res=315, pointsize=12)
+dev.off()
+
+```
+
+```{R DA-setup, echo=FALSE}
+ps.refilter <- subset_samples(ps.decon, location == 'fs')
+ps.refilter <- filter_taxa(ps.refilter, function(x) {sum(x>0) >= 1}, prune=TRUE)
+ps.refilter <- microfilter(ps=ps.refilter, PFT=10, RAT=1e-4)
+ps.refilter <- prune_samples (sample_sums(ps.refilter) >=50,ps.refilter)
+ps.refilter <- filter_taxa(ps.refilter, function(x) {sum(x>0) >= 1}, prune=TRUE)
+
+sd_refilt <- sample_data(ps.refilter)
+sd_refilt$TotalReads = sample_sums(ps.refilter)
+sd_refilt %>% ggplot(aes(x=reorder(condition,TotalReads), y=TotalReads), fill='#cccccc') +
+  geom_bar(stat='identity') + theme_bw() + theme(axis.text=element_text(size=6, angle=90)) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) +
+  geom_text(aes(label = TotalReads), hjust=-0.6, size=2, angle=90) + xlab('condition') 
+
+ps.fs.clean.sp_glom <- tax_glom(ps.refilter,taxrank="Species", NArm = F)
+
+```
+# Figure 3: Comparisons by study site
+```{R site, echo=FALSE}
+shan.test.site <- rstatix::wilcox_test(cstdf, Shannon ~ site, paired=F, exact=T) 
+  
+ggplot(cstdf, aes(x=site, y=Shannon)) +
+  geom_boxplot(aes(color=site, alpha=0.01, fill=site)) + 
+  geom_dotplot(aes(fill=site), binaxis='y', stackdir='center') +
+  theme_bw() + labs(fill='site', y='Shannon diversity', x='Study Site') +
+  theme(legend.position = "none") + 
+  scale_fill_manual(values=c('#71b3e4','#4B9B76')) +
+  scale_x_discrete(labels=c('South Africa','Uganda')) + 
+  scale_color_manual(values=c('#71b3e4','#4B9B76')) +
+  add_pvalue(shan.test.site, y.position=5.0, label='p')
+ggsave('fig3a-alpha.png', height=4, width=4)
+
+uf.site.ado <- adonis2(uf.dist ~ sample_data(ps.fs)$site)
+r2 <- sprintf('R^2 == %.2g', uf.site.ado$R2[1])
+pv <- sprintf('p == %.2g', uf.site.ado$`Pr(>F)`[1])
+plot_ordination(ps.fs, uf.ord) + 
+  geom_point(aes(fill=site), shape=21, size=4, color='black',  stroke=0.5) +
+  labs(fill='site') + scale_fill_manual(values=c('#71b3e4','#4B9B76'), labels=c('South Africa','Uganda')) +
+  coord_fixed(1) + 
+  theme_bw() +
+  theme(axis.title.x = element_text(size=9), 
+        axis.title.y = element_text(size=9),
+        legend.title = element_text(size=9),
+        legend.text = element_text(size=9),
+        legend.margin = margin(0,0,0,0),
+        legend.box.margin = margin(-5,-5,-5,-8)
+        ) +
+  annotate('text', label=r2,x=-0.20, y=0.40, parse=T) +
+  annotate('text', label=pv,x=-0.20, y=0.33, parse=T) 
+ggsave('fig3b-beta.png',height=3,width=4)
+
+aldex.site <- do_aldex(ps.fs.clean.sp_glom,'site')
+aldex.plot(aldex.site, type='MW', test='welch', xlab='Dispersion', ylab='Difference', cutoff=0.01)
+
+EnhancedVolcano(aldex.site, 
+                title=NULL,
+                subtitle=NULL,
+                lab=NA,
+                selectLab = NULL,
+                x='diff.btw', y='wi.eBH', 
+                pCutoff = 0.05, 
+                FCcutoff = 2,
+                ylim=c(0,3),
+                caption=NULL,
+                legendPosition= 'none'
+) + xlab('CLR difference') + 
+  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  annotate("text", x=0,y=1.4,label='BH p <0.05') +
+  annotate("text",x=2.2,y=0.5, label='ΔCLR >2', angle=90) + 
+  annotate("text",x=-2.2,y=0.5, label='ΔCLR <-2', angle=90) +
+  annotate("text",x=-3.1,y=1.65, label='C. acnes', fontface='bold') 
+ggsave('fig3-site-aldex2.png',width=5,height=5)
+
+ancombc.site <- ancombc(phyloseq = ps.fs.clean.sp_glom, formula="site", 
+                        p_adj_method = 'holm', prv_cut = 0, lib_cut=1000,
+                        group='site', struc_zero=F, neg_lb=TRUE, tol = 1e-5,
+                        max_iter=100, conserve=TRUE, alpha = 0.05, global=FALSE)
+
+ancom_done <- ancombc.site
+
+site_ti <- tibble(W=ancom_done$res$W$siteEB, lfc=ancom_done$res$lfc$siteEB, ASV=rownames(ancom_done$res$W),q=ancom_done$res$q_val$siteEB)
+
+n_taxa = ifelse(is.null(ancom_done$zero_ind), 
+                nrow(ancom_done$feature_table), 
+                sum(apply(ancom_done$zero_ind, 1, sum) == 0))
+
+cut_off = 0.7 * (n_taxa - 1)
+
+site_ti %>% 
+  mutate(sig_fill = case_when( 
+    q < 0.05 ~ 'sig',
+    T ~ 'insig'
+  ) ) %>%
+ggplot(aes(x=ASV, y=W, fill=sig_fill)) +
+  geom_point(shape=21, size=2, aes(alpha=0.9)) +
+  theme_bw() + 
+  theme(legend.position = 'none',
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    ) +
+  scale_x_discrete(expand=expansion(add =c(2,2))) +
+  ylim(-5,5) +
+  scale_fill_manual(values=c('#000000','#FF0000')) +
+  annotate('text',x=4,y=-4,label='C. acnes',hjust=0, fontface='bold') 
+
+EnhancedVolcano(site_ti, 
+                title=NULL,
+                subtitle=NULL,
+                lab=NA,
+                selectLab = NULL,
+                x='lfc', y='q', 
+                pCutoff = 0.05, 
+                FCcutoff = 20,
+                xlab = bquote(~Log[2]~'fold change'),
+                ylim=c(0,3),xlim=c(-3,3),
+                caption=NULL,
+                legendPosition= 'none'
+) + 
+  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  annotate("text", x=0,y=1.4,label='adj p <0.05') +
+  annotate("text",x=3.0,y=0.13, label=' W[0.7] > 102', angle=90, parse=T,hjust=0) + 
+  annotate("text",x=3.0,y=0.11, label='→', hjust=0) + 
+  annotate("text",x=-2.8,y=0.13, label=' W[0.7] < -102', angle=90, parse=T,hjust=0) +
+  annotate("text",x=-3.0,y=0.11, label='←' ,hjust=0) + 
+  annotate("text",x=-1.7,y=2.1, label='C. acnes', fontface='bold',hjust=0) 
+ggsave('fig3d-site-ancombc.png',width=5,height=5)
+
+site_d.poscount <- phyloseq_to_deseq2(ps.fs.clean.sp_glom, ~site) %>% 
+  estimateSizeFactors(type='poscounts') %>% 
+  DESeq(test='Wald', fitType='local')
+site_d.poscount.res <- results(site_d.poscount, alpha=0.05)
+
+EnhancedVolcano(site_d.poscount.res, 
+                title=NULL,
+                subtitle=NULL,
+                lab=NA,
+                selectLab = NULL,
+                x='log2FoldChange', y='padj', 
+                xlab = bquote(~Log[2]~'fold change'),
+                pCutoff = 0.05, 
+                FCcutoff = 2.5,
+                ylim=c(0,3),
+                caption=NULL,
+                legendPosition= 'none'
+) + 
+  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  annotate("text", x=0,y=1.4,label='adj p <0.05') +
+  #annotate("text",x=2.2,y=0.5, label='ΔCLR >2', angle=90) + 
+  #annotate("text",x=-2.2,y=0.5, label='ΔCLR <2', angle=90) +
+  annotate("text",x=-2.3,y=0.7, label='C. acnes', color='#999999', hjust=0) 
+ggsave('fig3e-site-deseq2.png', width=5, height=5)
+
+```
+# Figure 4: Comparisons by treatment arm
+```{R treatment, echo=FALSE}
+ps.fs.sd <- data.frame(sample_data(ps.fs))
+
+shan.test.drug <- rstatix::wilcox_test(ps.fs.sd, Shannon ~ drug_rename, 
+  comparisons = list(c('placebo','FTC/TAF'),c('placebo','FTC/TDF'),c('FTC/TAF','FTC/TDF') ), paired=F, exact=T, 
+  p.adjust.method = 'holm' ) %>%
+  rstatix::add_x_position()
+
+ggplot(ps.fs.sd, aes(x=drug_rename, y=Shannon)) +
+  geom_boxplot(aes(color=drug_rename, alpha=0.01, fill=drug_rename)) + 
+  geom_dotplot(aes(fill=drug_rename), binaxis='y', stackdir='center') +
+  theme_bw() + labs(fill='Treatment', y='Shannon diversity', x='Treatment') +
+  theme(legend.position = "none") + 
+  add_pvalue(shan.test.drug, y.position=c(4.8,5.0,4.8), label='p.adj.signif', bracket.shorten = c(0.025, 0, 0.025)) +
+  scale_fill_manual(values=c('#B3823E', '#0F8299','#7ABECC')) +
+  scale_color_manual(values=c('#B3823E', '#0F8299','#7ABECC')) 
+ggsave('fig4a-alpha.png', height=4, width=4)
+
+uf.drug.ado <- adonis2(uf.dist ~ sample_data(ps.fs)$drug)
+r2 <- sprintf('R^2 == %.2g', uf.drug.ado$R2[1])
+pv <- sprintf('p == %.2g', uf.drug.ado$`Pr(>F)`[1])
+plot_ordination(ps.fs, uf.ord) + 
+  geom_point(aes(fill=drug), shape=21, size=4, color='black',  stroke=0.5) +
+  labs(fill='Treatment') + scale_fill_manual(values=c('#B3823E', '#0F8299','#7ABECC'),labels=c('placebo','FTC/TAF','FTC/TDF')) +
+  coord_fixed(1) + 
+  theme_bw() +
+  theme(axis.title.x = element_text(size=9), 
+        axis.title.y = element_text(size=9),
+        legend.title = element_text(size=9),
+        legend.text = element_text(size=9),
+        legend.position = 'bottom',
+        legend.margin = margin(0,0,0,0),
+        legend.box.margin = margin(-5,-5,-5,-5)
+        ) +
+  annotate('text', label=c(r2,pv),x=-0.25, y=c(0.40, 0.34),size=3,parse=T) 
+ggsave('fig4b-beta.png', height=3, width=4)
+
+aldex.placebo <- do_aldex(ps.fs.clean.sp_glom,'placebo')
+aldex.plot(aldex.placebo, type='MW', test='welch', xlab='Dispersion', ylab='Difference', cutoff=0.01)
+EnhancedVolcano(aldex.placebo, 
+                lab=rownames(aldex.placebo), 
+                title=NULL,
+                subtitle=NULL,
+                selectLab=NA,
+                x='diff.btw', y='wi.eBH', 
+                FCcutoff = 2,
+                pCutoff=0.05, 
+                legendPosition= 'none',
+                ylim=c(0,0.2)) + xlab('CLR difference') +
+  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  annotate("text",x=0,y=0.2, label='↑ BH p = 0.05') +
+  annotate("text",x=2.2,y=0.02, label='ΔCLR >2', angle=90) + 
+  annotate("text",x=-2.2,y=0.02, label='ΔCLR <-2', angle=90)
+ggsave('fig4c-aldex2.png',width=5,height=5)
+
+ancombc.placebo <- ancombc(phyloseq = ps.fs.clean.sp_glom, formula="placebo", 
+                        p_adj_method = 'holm', prv_cut = 0, lib_cut=1000,
+                        group='site', struc_zero=F, neg_lb=TRUE, tol = 1e-5,
+                        max_iter=100, conserve=TRUE, alpha = 0.05, global=FALSE)
+
+ancom_done <- ancombc.placebo
+placebo_ti <- tibble(W=ancom_done$res$W$placeboTRUE, lfc=ancom_done$res$lfc$placeboTRUE, ASV=rownames(ancom_done$res$W),q=ancom_done$res$q_val$placeboTRUE)
+n_taxa = ifelse(is.null(ancom_done$zero_ind), 
+                nrow(ancom_done$feature_table), 
+                sum(apply(ancom_done$zero_ind, 1, sum) == 0))
+
+cut_off = 0.7 * (n_taxa - 1)
+placebo_ti %>% 
+  mutate(sig_fill = case_when( 
+    q < 0.05 ~ 'sig',
+    T ~ 'insig'
+  ) ) %>%
+  ggplot(aes(x=ASV, y=W, fill=sig_fill)) +
+  geom_point(shape=21, size=2, aes(alpha=0.9)) +
+  theme_bw() + 
+  theme(legend.position = 'none',
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major.x = element_blank(),
+  ) +
+  scale_x_discrete(expand=expansion(add =c(2,2))) +
+  ylim(-5,5) +
+  scale_fill_manual(values=c('#000000','#FF0000')) 
+
+EnhancedVolcano(placebo_ti, 
+                title=NULL,
+                subtitle=NULL,
+                lab=NA,
+                selectLab = NULL,
+                x='lfc', y='q', 
+                pCutoff = 0.05, 
+                FCcutoff = 20,
+                xlab = bquote(~Log[2]~'fold change'),
+                ylim=c(0,1.5),xlim=c(-3,3),
+                caption=NULL,
+                legendPosition= 'none'
+) + 
+  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  annotate("text", x=2.5,y=1.35,label='adj p <0.05') +
+  annotate("text",x=3.0,y=0.5, label=' W[0.7] > 102', angle=90, parse=T,hjust=0) + 
+  annotate("text",x=3.0,y=0.47, label='→', hjust=0) + 
+  annotate("text",x=-2.8,y=0.5, label=' W[0.7] < -102', angle=90, parse=T,hjust=0) +
+  annotate("text",x=-3.0,y=0.47, label='←' ,hjust=0) + 
+  annotate("text",x=-0.85,y=1.35, label='Dialister sp', hjust=0, color='#999999') 
+ggsave('fig4d-ancombc.png',width=5,height=5)
+
+tx_d <- phyloseq_to_deseq2(ps.fs.clean.sp_glom, ~ placebo)
+tx_d <- estimateSizeFactors(tx_d, type='poscounts')
+tx_d <- DESeq(tx_d, test='Wald', fitType='local')
+tx_d.res <- results(tx_d, alpha=0.05)
+
+EnhancedVolcano(tx_d.res, 
+                title=NULL,
+                subtitle=NULL,
+                lab=NA,
+                selectLab = NULL,
+                x='log2FoldChange', y='padj', 
+                xlab = bquote(~Log[2]~'fold change'),
+                pCutoff = 0.05, 
+                FCcutoff = 2.5,
+                ylim=c(0,1.5),
+                caption=NULL,
+                legendPosition= 'none'
+) + 
+  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  annotate("text", x=0,y=1.35,label='adj p <0.05') 
+ggsave('fig4e-deseq2.png', width=5, height=5)
+```
+
+# RNA-seq analysis
+```{R rna_setup}
+ens <- useEnsembl(biomart='ensembl', dataset='hsapiens_gene_ensembl')
+taxa <- data.frame(tax_table(ps.fs.clean.sp_glom))
+taxa$ASV <- rownames(taxa)
+taxa$Species[is.na(taxa$Species)] <- '(unclassified)'
+taxa$gene_sp <- paste0(taxa$Genus, ' ',taxa$Species)
+taxa['ASV0540','gene_sp'] <- '(Uknown Muribaculaceae)'
+
+cut_GP <- c('Corynebacterium', 'Cutibacterium','Dermabacter', 'Anaerococcus')
+oral_GP <- c('Rothia','Porphyromonas','Parvimonas')
+GU_GP <- c('Mycoplasma', 'Lactobacillus')
+bv_bact <- c('Sneathia', 'Atopobium', 'Prevotella')
+env_org <- c('Brevibacterium','Dietzia','Enhydrobacter', 'Aliicoccus')
+
+genes.infl.hi<-read.csv('data/infl_resp_cor_high_count_bh-20220809.csv', header=T)
+infl.ens <- getBM(
+  attributes = c('ensembl_gene_id','description','external_gene_name','go_id','name_1006','definition_1006','namespace_1003'),
+  filters = 'ensembl_gene_id',
+  values = genes.infl.hi$ensgene,
+  mart = ens
+)
+
+infl.ens.short <- infl.ens %>% dplyr::select(ensembl_gene_id,external_gene_name, go_id, name_1006)
+infl.pro <- infl.ens.short %>% filter(grepl('defense response to .* bacteri',name_1006))
+infl.pro <- infl.ens.short %>% filter(grepl('neutrophil chemotaxis', name_1006)) %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('innate immune response', name_1006), external_gene_name == 'PSTPIP1') %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('Fc-epsilon receptor signaling', name_1006), external_gene_name != 'PLCG2') %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('interleukin-8', name_1006), external_gene_name != 'TLR1', external_gene_name!='RELA') %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('interleukin-15-mediated signaling pathway', name_1006)) %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('positive regulation of macrophage cytokine', name_1006), external_gene_name != 'PLCG2', external_gene_name != 'RIPK2') %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('arachidonic acid secretion', name_1006)) %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('transforming growth factor beta', name_1006)) %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('immune response', name_1006), external_gene_name == 'CXCR6' | external_gene_name == 'XCR1') %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('response to bacterium', name_1006), external_gene_name != 'CXCL9', external_gene_name != 'PPBP') %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('response to bacterial lipopeptide', name_1006)) %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('complement receptor mediated signaling', name_1006)) %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('response to lipopolysaccharide', name_1006), external_gene_name == 'PLCG2') %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('complement activation$', name_1006)) %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('inflammatory response', name_1006), external_gene_name == 'ODAM' | external_gene_name == 'IL9') %>% bind_rows(infl.pro)
+infl.pro <- infl.ens.short %>% filter(grepl('response to tumor necrosis factor', name_1006), external_gene_name == 'HDAC4') %>% bind_rows(infl.pro)
+infl.pro <- infl.pro %>% mutate(pro = T)
+
+infl.anti <- infl.ens.short %>% filter(grepl('negative regulation of inflammatory ',name_1006))
+infl.anti <- infl.ens.short %>% filter(grepl('regulation of inflammatory response',name_1006), external_gene_name == 'ADAMTS12') %>% bind_rows(infl.anti)
+infl.anti <- infl.ens.short %>% filter(grepl('negative regulation of toll-like receptor 4', name_1006)) %>% bind_rows(infl.anti)
+infl.anti <- infl.ens.short %>% filter(grepl('negative regulation of interleukin-1-mediated signaling', name_1006)) %>% bind_rows(infl.anti)
+infl.anti <- infl.ens.short %>% filter(grepl('regulation of tumor necrosis factor-mediated signaling', name_1006)) %>% bind_rows(infl.anti)
+infl.anti <- infl.ens.short %>% filter(grepl('negative regulation of cytokine production involved in inflammatory', name_1006)) %>% bind_rows(infl.anti)
+infl.anti <- infl.anti %>% mutate(pro = F)
+
+infl.fn <- bind_rows(infl.pro, infl.anti)
+
+infl.fn <- infl.fn %>% mutate(fn_group = case_when(
+  name_1006 == 'negative regulation of inflammatory response' ~ 'regulation of inflammatory response',
+  name_1006 == 'negative regulation of interleukin-1-mediated signaling pathway' ~ 'regulation of inflammatory response',
+  name_1006 == 'negative regulation of toll-like receptor 4 signaling pathway' ~ 'regulation of inflammatory response',
+  name_1006 == 'regulation of tumor necrosis factor-mediated signaling pathway' ~ 'regulation of inflammatory response',
+  name_1006 == 'transforming growth factor beta receptor signaling pathway' ~ 'regulation of inflammatory response',
+  name_1006 == 'cellular response to tumor necrosis factor' ~ 'inflammatory response',
+  name_1006 == 'positive regulation of interleukin-8 production' ~ 'inflammatory response',
+  name_1006 == 'interleukin-15-mediated signaling pathway' ~ 'inflammatory response',
+  name_1006 == 'positive regulation of macrophage cytokine production' ~ 'inflammatory response',
+  name_1006 == 'negative regulation of cytokine production involved in inflammatory response' ~ 'regulation of inflammatory response',
+  name_1006 == 'regulation of neutrophil chemotaxis' ~ 'neutrophil chemotaxis',
+  name_1006 == 'positive regulation of neutrophil chemotaxis' ~ 'neutrophil chemotaxis',
+  name_1006 == 'defense response to Gram-negative bacterium' ~ 'response to bacterium',
+  name_1006 == 'defense response to Gram-positive bacterium' ~ 'response to bacterium',
+  name_1006 == 'defense response to bacterium' ~ 'response to bacterium',
+  name_1006 == 'response to lipopolysaccharide' ~ 'response to bacterium',
+  name_1006 == 'cellular response to bacterial lipopeptide' ~ 'response to bacterium',
+  name_1006 == 'arachidonic acid secretion' ~ 'inflammatory response',
+  name_1006 == 'innate immune response' ~ 'immune response',
+  T ~ name_1006
+  )
+                   )
+```
+
+## Figure 5: Bacterial species and inflammatory relationships
+
+```{r rna_sp_fn}
+infl_colors = c(
+  '#3b5bdb','#3b5bdb',
+  '#4C6ef5',
+  '#748ffc','#748ffc',
+  '#91a7ff', 
+  '#bac8ff',
+  '#f06595',
+  '#364FC7', '#364FC7','#3b5bdb','#3b5bdb','#3b5bdb','#4263eb','#4C6ef5','#4C6ef5','#4C6ef5',
+  '#59102a','#FFD43B','#59102a','#59102a',
+  '#5c7cfa','#748ffc','#91a7ff','#91a7ff','#748ffc',
+  '#59102a',
+  '#91a7ff',
+  '#59102a',
+  '#3b5bdb','#283a94','#748ffc'
+)
+
+anaer.tab <- read.csv('data/anaerobes-site-20220807.csv',header=T)
+anaer.tab$niche <- factor(anaer.tab$niche, levels = c('unspec','skin','enteric','oral','environment','vaginal','vaginal-BV') )
+
+niche_fill_colors <- list('unspec'      ='#cccccc',
+                         'skin'        ='#000000',
+                         'enteric'     ='#825B3A',
+                         'oral'        ='#FF66FF',
+                         'environment' ='#2F9E44',
+                         'vaginal'     ='#FD7E14',
+                         'vaginal-BV'  ='#FF0000'
+)
+
+gene_sp_plot_data <- genes.infl.hi %>% 
+  distinct(bact_sp,symbol, .keep_all =T) %>% #drop double C4a, but TODO: figure out why it's here
+  left_join(taxa, by=c('bact_sp' = 'ASV')) %>% 
+  left_join(anaer.tab, by=c('Genus')) %>%
+  right_join(infl.fn, by=c('ensgene' = 'ensembl_gene_id')) %>%
+  mutate(gene_sp_f = as.factor(gene_sp)) %>%
+  mutate(fn_group_f = factor(fn_group, levels=c('complement activation', 'complement receptor mediated signaling pathway','Fc-epsilon receptor signaling pathway','immune response','inflammatory response','neutrophil chemotaxis','response to bacterium','regulation of inflammatory response')) ) %>%
+  mutate(fn_group_int = as.numeric(fn_group_f)) %>%
+  replace_na(list(niche='unspec')) 
+
+#adjust for unannotated Genus
+gene_sp_plot_data[gene_sp_plot_data$gene_sp == '(Uknown Muribaculaceae)','niche'] <- 'enteric'
+
+gene_sp_plot_data <- gene_sp_plot_data %>% mutate(niche_int = as.numeric(niche)) 
+
+sp_colors <- gene_sp_plot_data %>% distinct(gene_sp_f, .keep_all =T) %>% arrange(niche) 
+
+gene_sp.plot <- gene_sp_plot_data %>% arrange(fn_group) %>% 
+  ggplot( aes(fill=fn_group_f, y=cor, x=fct_reorder(gene_sp_f,niche_int)), order=fn_group) + 
+  geom_bar(position='stack', stat='identity') + theme_bw() + 
+  theme(axis.text=element_text(angle=90,hjust=1),
+        legend.position = 'bottom',
+        axis.text.x = element_text(vjust=0)) + 
+  scale_fill_manual(values=infl_colors, name='GO terms') +
+  ylab('Pearson correlation coefficient') + xlab(NULL) +
+  scale_y_continuous(breaks = c(-4,-3,-2,-1,-0,1), expand = expansion(0)) +
+  scale_x_discrete(expand = expansion(add=0.5)) +
+  geom_text(aes(label = symbol), hjust=0.5, vjust=3, size=2, position='stack') 
+
+offset = 0.5
+y.min = -3.4
+y.max = -3.0
+niche_rects = list()
+for (i in seq_along(levels(anaer.tab$niche))) {
+  niche_lvl <- levels(anaer.tab$niche)[i]
+  n_bact_rows <- sum(sp_colors$niche == niche_lvl)
+  rect.R <- offset + n_bact_rows
+  gene_sp.plot <- gene_sp.plot + annotate('rect', fill = niche_fill_colors[niche_lvl], xmin = offset, xmax = rect.R, ymin = y.min, ymax = y.max)
+  gene_sp.plot <- gene_sp.plot + annotate('text', color = '#FFFFFF', x = offset+0.25, y = -3.2, label=niche_lvl, hjust=0)
+  offset = rect.R
+}
+(gene_sp.plot)
+ggsave('fig5-taxa_rna.png', width=16, height=9)
+```
+
+## Table 1: taxon/gene correlations
+```{R rna_sp_table}
+gene_tbl.hi <- genes.infl.hi %>% left_join(taxa, by=c('bact_sp' = 'ASV')) %>%
+  dplyr::select(symbol, gene_sp, cor, p)
+
+write.csv(gene_tbl.hi, file='gene_sp.csv')
+```
+
+## Supplemental Table S1: gene categorization
+```{R rna_fn_table}
+infl.fn %>% select(external_gene_name,go_id,name_1006,pro,fn_group) %>%
+  arrange(external_gene_name) %>% mutate(pro = ifelse(pro, 'pro','anti')) %>%
+  write.csv(file='infl_fn.csv')
+```
+
+## Supplemental Table S2: Genus/gene correlations
+```{r genus, include=FALSE, echo=FALSE}
+genes.infl.genus<-read.csv('data/infl_resp_cor_hc_freq_genus_bh-20220809.csv', header=T)
+
+ps.fs.clean.ge_glom <- tax_glom(ps.fs.clean.sp_glom,taxrank="Genus", NArm = F)
+
+taxa.g <- data.frame(tax_table(ps.fs.clean.ge_glom))
+taxa.g['ASV0540','Genus'] <- '(Unknown Muribaculaceae)'
+taxa.g$ASV <- rownames(taxa.g)
+
+gene_genus_tbl <- genes.infl.genus %>% left_join(taxa.g, by=c('bact_sp'= 'ASV')) %>%
+  dplyr::select(symbol,Genus,cor,p) %>% arrange(Genus)
+write.csv(gene_genus_tbl, file='gene_genus.csv')
+
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+genes.infl.genus %>% left_join(taxa.g, by=c('bact_sp' = 'ASV')) %>%
+  ggplot( aes(fill=symbol, y=cor, x=Genus)) + 
+  geom_bar(position='stack', stat='identity') + theme_bw() +
+  theme(axis.text=element_text(angle=90,hjust=1), legend.position='none') + #scale_fill_manual(values=col_vector) +
+  geom_text(aes(label = symbol), hjust=0.5, vjust=3, size=2, position='stack')
+```
