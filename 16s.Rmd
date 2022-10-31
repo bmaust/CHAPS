@@ -874,7 +874,7 @@ EnhancedVolcano(aldex.placebo,
                 pCutoff=0.05, 
                 legendPosition= 'none',
                 ylim=c(0,0.2)) + xlab('CLR difference') +
-  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  labs(caption=c('Higher with active drug','Higher with placebo')) + theme(plot.caption = element_text(hjust=c(0,1))) +
   annotate("text",x=0,y=0.2, label='↑ BH p = 0.05') +
   annotate("text",x=2.2,y=0.02, label='ΔCLR >2', angle=90) + 
   annotate("text",x=-2.2,y=0.02, label='ΔCLR <-2', angle=90)
@@ -922,7 +922,7 @@ EnhancedVolcano(placebo_ti,
                 caption=NULL,
                 legendPosition= 'none'
 ) + 
-  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  labs(caption=c('Higher with active drug','Higher with placebo')) + theme(plot.caption = element_text(hjust=c(0,1))) +
   annotate("text", x=2.5,y=1.35,label='adj p <0.05') +
   annotate("text",x=3.0,y=0.5, label=' W[0.7] > 102', angle=90, parse=T,hjust=0) + 
   annotate("text",x=3.0,y=0.47, label='→', hjust=0) + 
@@ -949,7 +949,7 @@ EnhancedVolcano(tx_d.res,
                 caption=NULL,
                 legendPosition= 'none'
 ) + 
-  labs(caption=c('Higher in South Africa','Higher in Uganda')) + theme(plot.caption = element_text(hjust=c(0,1))) +
+  labs(caption=c('Higher with active drug','Higher with placebo')) + theme(plot.caption = element_text(hjust=c(0,1))) +
   annotate("text", x=0,y=1.35,label='adj p <0.05') 
 ggsave('fig4e-deseq2.png', width=5, height=5)
 ```
